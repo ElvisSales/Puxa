@@ -1,0 +1,5 @@
+services:
+  - type: web
+    name: baixador
+    runtime: docker
+    plan: free

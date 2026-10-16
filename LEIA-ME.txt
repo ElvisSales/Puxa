@@ -1,0 +1,31 @@
+PUXA — BAIXADOR INSTA & FACE
+=====================
+
+COMO INSTALAR (uma vez só)
+1. Instale o Python 3.10 ou mais novo: https://www.python.org/downloads/
+   (no Windows, marque "Add Python to PATH" na instalação)
+2. Abra o terminal (Prompt de Comando) dentro desta pasta e rode:
+      pip install -r requirements.txt
+3. (Opcional, recomendado) Instale o ffmpeg para vídeos com melhor qualidade e áudio:
+      Windows:  winget install ffmpeg
+      Mac:      brew install ffmpeg
+
+COMO USAR
+1. Na pasta, rode:   python app.py
+2. Abra no navegador:   http://localhost:5000
+3. Cole o link, escolha Instagram/Facebook e Imagem/Vídeo, clique em Baixar.
+   - O site já tenta detectar a rede e se é vídeo sozinho ao colar o link.
+   - Carrossel com várias fotos/vídeos vem num arquivo .zip.
+
+SE DER ERRO DE "EXIGE LOGIN"
+O Instagram e o Facebook bloqueiam muitos downloads sem estar logado.
+1. Instale no Chrome a extensão "Get cookies.txt LOCALLY".
+2. Entre no instagram.com (e/ou facebook.com) logado, clique na extensão e exporte.
+3. Salve o arquivo como  cookies.txt  dentro desta pasta e reinicie o app.
+   Guarde esse arquivo só com você: ele dá acesso à sua conta.
+
+SE PARAR DE FUNCIONAR
+As redes mudam com frequência. Atualize as ferramentas:
+      pip install -U yt-dlp gallery-dl
+
+Baixe apenas conteúdo seu ou que você tenha permissão para usar.
