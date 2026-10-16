@@ -44,6 +44,8 @@ def baixar_video(url, pasta):
         "quiet": True,
         "noprogress": True,
         "noplaylist": False,
+        "socket_timeout": 20,
+        "retries": 2,
         # Com ffmpeg junta vídeo + áudio na melhor qualidade; sem ele, pega o melhor arquivo único
         "format": "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b" if tem_ffmpeg else "b[ext=mp4]/b",
     }
@@ -56,11 +58,12 @@ def baixar_video(url, pasta):
 
 
 def baixar_imagens(url, pasta):
-    cmd = [sys.executable, "-m", "gallery_dl", "-D", pasta, "--no-mtime"]
+    cmd = [sys.executable, "-m", "gallery_dl", "-D", pasta, "--no-mtime",
+           "-o", "extractor.timeout=20", "-o", "downloader.http.timeout=20", "-R", "2"]
     if COOKIES_FILE:
         cmd += ["--cookies", COOKIES_FILE]
     cmd.append(url)
-    resultado = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    resultado = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
     if resultado.returncode not in (0, 4):  # 4 = alguns itens falharam, mas outros vieram
         raise RuntimeError(resultado.stderr.strip() or "Falha ao baixar as imagens.")
 
@@ -128,12 +131,14 @@ def baixar():
 
     except yt_dlp.utils.DownloadError as e:
         texto = str(e)
+        app.logger.error("Falha yt-dlp em %s: %s", url, texto)
         if "login" in texto.lower() or "cookies" in texto.lower():
             return jsonify(erro="Esse post exige login. Veja no LEIA-ME como usar o cookies.txt."), 403
         return jsonify(erro="Não consegui baixar: " + texto.replace("ERROR: ", "")[:300]), 502
     except subprocess.TimeoutExpired:
-        return jsonify(erro="Demorou demais para baixar. Tente de novo."), 504
+        return jsonify(erro="O Instagram/Facebook não respondeu a tempo (provável bloqueio ao servidor). Tente de novo em alguns minutos."), 504
     except Exception as e:  # noqa: BLE001
+        app.logger.error("Falha em %s: %s", url, e)
         return jsonify(erro="Não consegui baixar: " + str(e)[:300]), 502
     finally:
         shutil.rmtree(pasta, ignore_errors=True)
