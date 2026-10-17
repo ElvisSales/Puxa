@@ -164,8 +164,12 @@
     botao.textContent = "Puxando…";
     mostrar('<span class="spinner"></span>Isso pode levar alguns segundos');
 
+    const controle = new AbortController();
+    const limite = setTimeout(() => controle.abort(), 150000);
+    const aviso = setTimeout(() => mostrar('<span class="spinner"></span>Ainda tentando… o servidor pode estar acordando'), 20000);
     try {
       const resp = await fetch("/baixar", {
+        signal: controle.signal,
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(dados),
@@ -189,8 +193,9 @@
       setTimeout(() => URL.revokeObjectURL(link.href), 10000);
       mostrar("Pronto: " + nome, "ok");
     } catch (err) {
-      mostrar(err.message, "erro");
+      mostrar(err.name === "AbortError" ? "Demorou demais. O Instagram/Facebook pode estar bloqueando o servidor — tente de novo." : err.message, "erro");
     } finally {
+      clearTimeout(limite); clearTimeout(aviso);
       botao.disabled = false;
       botao.textContent = "Puxar arquivo";
     }
