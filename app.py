@@ -10,6 +10,9 @@ import subprocess
 import sys
 import tempfile
 import zipfile
+from html import unescape
+
+import requests
 
 from flask import Flask, jsonify, render_template, request, send_file
 import yt_dlp
@@ -63,9 +66,64 @@ def baixar_imagens(url, pasta):
     if COOKIES_FILE:
         cmd += ["--cookies", COOKIES_FILE]
     cmd.append(url)
-    resultado = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+    resultado = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
     if resultado.returncode not in (0, 4):  # 4 = alguns itens falharam, mas outros vieram
         raise RuntimeError(resultado.stderr.strip() or "Falha ao baixar as imagens.")
+
+
+NAVEGADOR = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/128.0 Safari/537.36",
+    "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+}
+
+
+def _limpar_url(u):
+    u = unescape(u)
+    return u.replace("\\/", "/").replace("\\u0026", "&").replace("\\", "")
+
+
+def urls_imagem_instagram(url):
+    """Plano B: lê a página pública de incorporação (embed) do post."""
+    m = re.search(r"instagram\.com/(?:[\w.]+/)?(p|reel|reels|tv)/([\w-]+)", url)
+    if not m:
+        return []
+    embed = f"https://www.instagram.com/p/{m.group(2)}/embed/captioned/"
+    html = requests.get(embed, headers=NAVEGADOR, timeout=20).text
+    achadas = []
+    # Carrossel e posts com JSON embutido
+    for bruto in re.findall(r'display_url\\?":\\?"(.*?)\\?"', html):
+        achadas.append(_limpar_url(bruto))
+    # Imagem principal do embed (pega a maior do srcset)
+    for srcset in re.findall(r'class="EmbeddedMediaImage"[^>]*srcset="([^"]+)"', html):
+        achadas.append(_limpar_url(srcset.split(",")[-1].strip().split(" ")[0]))
+    for src in re.findall(r'class="EmbeddedMediaImage"[^>]*src="([^"]+)"', html):
+        achadas.append(_limpar_url(src))
+    vistos, unicas = set(), []
+    for a in achadas:
+        chave = a.split("?")[0].rsplit("/", 1)[-1]  # mesmo arquivo em tamanhos diferentes
+        if a.startswith("http") and chave not in vistos:
+            vistos.add(chave)
+            unicas.append(a)
+    return unicas[:20]
+
+
+def urls_imagem_og(url):
+    """Plano B genérico (Facebook): a imagem de pré-visualização da página."""
+    html = requests.get(url, headers=NAVEGADOR, timeout=20).text
+    m = re.search(r'<meta[^>]+property="og:image"[^>]+content="([^"]+)"', html) or \
+        re.search(r'<meta[^>]+content="([^"]+)"[^>]+property="og:image"', html)
+    return [_limpar_url(m.group(1))] if m else []
+
+
+def baixar_imagens_plano_b(url, plataforma, pasta):
+    urls = urls_imagem_instagram(url) if plataforma == "instagram" else urls_imagem_og(url)
+    for i, u in enumerate(urls, 1):
+        r = requests.get(u, headers=NAVEGADOR, timeout=30)
+        if r.ok and r.headers.get("Content-Type", "").startswith("image/"):
+            ext = ".png" if "png" in r.headers["Content-Type"] else ".webp" if "webp" in r.headers["Content-Type"] else ".jpg"
+            with open(os.path.join(pasta, f"imagem_{i:02d}{ext}"), "wb") as f:
+                f.write(r.content)
 
 
 def arquivos_da_pasta(pasta, extensoes):
@@ -77,9 +135,19 @@ def arquivos_da_pasta(pasta, extensoes):
     return achados
 
 
+def tem_anuncio():
+    """True se templates/anuncio.html tiver algum código além de comentários."""
+    caminho = os.path.join(app.root_path, "templates", "anuncio.html")
+    if not os.path.exists(caminho):
+        return False
+    with open(caminho, encoding="utf-8") as f:
+        texto = re.sub(r"<!--.*?-->", "", f.read(), flags=re.S)
+    return bool(texto.strip())
+
+
 @app.route("/")
 def index():
-    return render_template("index.html")
+    return render_template("index.html", tem_anuncio=tem_anuncio())
 
 
 @app.route("/baixar", methods=["POST"])
@@ -107,8 +175,20 @@ def baixar():
             baixar_video(url, pasta)
             arquivos = arquivos_da_pasta(pasta, VID_EXT)
         else:
-            baixar_imagens(url, pasta)
+            # 1º: caminho rápido pela página pública do post (poucos segundos)
+            try:
+                baixar_imagens_plano_b(url, detectada, pasta)
+            except requests.RequestException as e:
+                app.logger.warning("Caminho rápido falhou em %s: %s", url, e)
             arquivos = arquivos_da_pasta(pasta, IMG_EXT)
+            app.logger.info("Caminho rápido achou %d imagem(ns) em %s", len(arquivos), url)
+            # 2º: se não achou nada, tenta o gallery-dl
+            if not arquivos:
+                try:
+                    baixar_imagens(url, pasta)
+                except (RuntimeError, subprocess.TimeoutExpired) as e:
+                    app.logger.warning("gallery-dl falhou em %s: %s", url, str(e)[:300])
+                arquivos = arquivos_da_pasta(pasta, IMG_EXT)
 
         if not arquivos:
             msg = "Nenhum vídeo encontrado nesse link." if tipo == "video" else "Nenhuma imagem encontrada nesse link."
@@ -143,6 +223,9 @@ def baixar():
     finally:
         shutil.rmtree(pasta, ignore_errors=True)
 
+
+import logging
+app.logger.setLevel(logging.INFO)
 
 if __name__ == "__main__":
     print("Abra no navegador: http://localhost:5000")
