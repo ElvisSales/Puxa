@@ -116,6 +116,41 @@ def urls_imagem_og(url):
     return [_limpar_url(m.group(1))] if m else []
 
 
+def urls_imagem_ytdlp(url):
+    """Usa o yt-dlp (que já passa pelo Instagram, como nos vídeos) só para ler as fotos do post."""
+    opts = {"quiet": True, "no_warnings": True, "skip_download": True,
+            "ignore_no_formats_error": True, "socket_timeout": 20}
+    if COOKIES_FILE:
+        opts["cookiefile"] = COOKIES_FILE
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+    itens = list(info.get("entries") or []) or [info]
+    urls = []
+    for item in itens:
+        if not item:
+            continue
+        formatos = item.get("formats") or []
+        if any(f.get("vcodec") not in (None, "none") for f in formatos):
+            continue  # é vídeo: pula, aqui só queremos fotos
+        miniaturas = [t for t in (item.get("thumbnails") or []) if t.get("url")]
+        if miniaturas:
+            maior = max(miniaturas, key=lambda t: ((t.get("width") or 0) * (t.get("height") or 0), t.get("preference") or 0))
+            urls.append(maior["url"])
+        elif item.get("thumbnail"):
+            urls.append(item["thumbnail"])
+    return urls
+
+
+def salvar_imagens(urls, pasta, prefixo="imagem"):
+    for i, u in enumerate(urls, 1):
+        r = requests.get(u, headers=NAVEGADOR, timeout=30)
+        tipo = r.headers.get("Content-Type", "")
+        if r.ok and tipo.startswith("image/"):
+            ext = ".png" if "png" in tipo else ".webp" if "webp" in tipo else ".jpg"
+            with open(os.path.join(pasta, f"{prefixo}_{i:02d}{ext}"), "wb") as f:
+                f.write(r.content)
+
+
 def baixar_imagens_plano_b(url, plataforma, pasta):
     urls = urls_imagem_instagram(url) if plataforma == "instagram" else urls_imagem_og(url)
     for i, u in enumerate(urls, 1):
@@ -175,14 +210,22 @@ def baixar():
             baixar_video(url, pasta)
             arquivos = arquivos_da_pasta(pasta, VID_EXT)
         else:
-            # 1º: caminho rápido pela página pública do post (poucos segundos)
+            # 1º: yt-dlp (mesmo caminho que já funciona para vídeos)
             try:
-                baixar_imagens_plano_b(url, detectada, pasta)
-            except requests.RequestException as e:
-                app.logger.warning("Caminho rápido falhou em %s: %s", url, e)
+                salvar_imagens(urls_imagem_ytdlp(url), pasta)
+            except Exception as e:  # noqa: BLE001
+                app.logger.warning("yt-dlp (fotos) falhou em %s: %s", url, str(e)[:300])
             arquivos = arquivos_da_pasta(pasta, IMG_EXT)
-            app.logger.info("Caminho rápido achou %d imagem(ns) em %s", len(arquivos), url)
-            # 2º: se não achou nada, tenta o gallery-dl
+            app.logger.info("yt-dlp achou %d imagem(ns) em %s", len(arquivos), url)
+            # 2º: caminho rápido pela página pública do post
+            if not arquivos:
+                try:
+                    baixar_imagens_plano_b(url, detectada, pasta)
+                except requests.RequestException as e:
+                    app.logger.warning("Caminho rápido falhou em %s: %s", url, e)
+                arquivos = arquivos_da_pasta(pasta, IMG_EXT)
+                app.logger.info("Caminho rápido achou %d imagem(ns) em %s", len(arquivos), url)
+            # 3º: se ainda não achou nada, tenta o gallery-dl
             if not arquivos:
                 try:
                     baixar_imagens(url, pasta)
@@ -206,7 +249,7 @@ def baixar():
             for caminho in arquivos:
                 z.write(caminho, os.path.basename(caminho))
         zip_mem.seek(0)
-        return send_file(zip_mem, as_attachment=True, download_name=f"{detectada}_{tipo}s.zip",
+        return send_file(zip_mem, as_attachment=True, download_name=f"{detectada}_{'imagens' if tipo == 'imagem' else 'videos'}.zip",
                          mimetype="application/zip")
 
     except yt_dlp.utils.DownloadError as e:
