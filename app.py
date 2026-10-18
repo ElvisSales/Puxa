@@ -11,6 +11,7 @@ import sys
 import tempfile
 import zipfile
 from html import unescape
+from urllib.parse import parse_qs, quote, urlparse
 
 import requests
 
@@ -115,15 +116,66 @@ class EVideo(Exception):
 ROBO_FACEBOOK = {"User-Agent": "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)"}
 
 
+def resolver_facebook(url):
+    """Links /share/... redirecionam para o login, mas o endereço real do post vem junto no "next".
+    Devolve o link direto do post (ex.: facebook.com/<id>/posts/<post>), que não pede login."""
+    if not re.search(r"facebook\.com/share/|fb\.watch/|m\.facebook\.com|web\.facebook\.com", url):
+        return url
+    try:
+        r = requests.get(url, headers=NAVEGADOR, timeout=15, allow_redirects=True)
+        final = r.url
+    except requests.RequestException as e:
+        app.logger.warning("Não consegui resolver %s: %s", url, e)
+        return url
+    if "/login" in final:
+        prox = parse_qs(urlparse(final).query).get("next", [""])[0]
+        if prox:
+            final = prox
+    q = parse_qs(urlparse(final).query)
+    if "story_fbid" in q and "id" in q:
+        final = f"https://www.facebook.com/{q['id'][0]}/posts/{q['story_fbid'][0]}/"
+    elif "fbid" in q and "photo" in final:
+        final = f"https://www.facebook.com/photo/?fbid={q['fbid'][0]}"
+    final = final.replace("://m.facebook.com", "://www.facebook.com").replace("://web.facebook.com", "://www.facebook.com")
+    if final != url:
+        app.logger.info("Link do Facebook resolvido: %s -> %s", url, final)
+    return final
+
+
+def _fotos_do_html_facebook(html):
+    """Pega as fotos do post (ignora foto de perfil, emojis e ícones)."""
+    urls = []
+    for bruto in re.findall(r'<img[^>]+src="(https://scontent[^"]+)"', html):
+        u = _limpar_url(bruto)
+        if "t39.30808-1/" in u or "/p50x50/" in u or "/s40x40/" in u or "_s40x40" in u:
+            continue  # foto de perfil
+        if u not in urls:
+            urls.append(u)
+    return urls
+
+
 def urls_imagem_facebook(url):
-    """Lê a página como o robô de prévias do Facebook (o mesmo que monta as prévias do WhatsApp)."""
+    """1º: a versão "incorporável" do post (a mesma que outros sites usam para mostrar posts públicos).
+    2º: a prévia que o Facebook gera para o WhatsApp (og:image)."""
+    # Versão incorporável
+    embed = "https://www.facebook.com/plugins/post.php?href=" + quote(url, safe="") + "&show_text=false&width=500"
+    try:
+        html = requests.get(embed, headers=NAVEGADOR, timeout=20).text
+        if re.search(r"<video|\"video_id\"|/videos/", html) and not _fotos_do_html_facebook(html):
+            raise EVideo()
+        urls = _fotos_do_html_facebook(html)
+        app.logger.info("Embed do Facebook: %d foto(s) em %s", len(urls), url)
+        if urls:
+            return urls[:20]
+    except requests.RequestException as e:
+        app.logger.warning("Embed do Facebook falhou em %s: %s", url, e)
+    # Prévia (og:image)
     urls = []
     for cabecalho in (ROBO_FACEBOOK, NAVEGADOR):
-        r = requests.get(url, headers=cabecalho, timeout=20, allow_redirects=True)
-        html = r.text
+        html = requests.get(url, headers=cabecalho, timeout=20, allow_redirects=True).text
         if re.search(r'property="og:video|property="og:type"[^>]+content="video|content="video[^"]*"[^>]+property="og:type"', html):
             app.logger.info("Prévia do Facebook indica vídeo em %s", url)
-            raise EVideo()  # é vídeo: a "foto" seria só a capa; vai direto para o vídeo
+            raise EVideo()
         for padrao in (r'<meta[^>]+property="og:image(?::url)?"[^>]+content="([^"]+)"',
                        r'<meta[^>]+content="([^"]+)"[^>]+property="og:image(?::url)?"'):
             for achado in re.findall(padrao, html):
@@ -133,7 +185,6 @@ def urls_imagem_facebook(url):
         if urls:
             break
     return urls
-
 
 def urls_imagem_ytdlp(url):
     """Usa o yt-dlp (que já passa pelo Instagram, como nos vídeos) só para ler as fotos do post."""
@@ -195,7 +246,7 @@ def buscar_videos(url, pasta):
     except yt_dlp.utils.DownloadError as e:
         texto = str(e)
         app.logger.warning("yt-dlp (vídeo) falhou em %s: %s", url, texto[:300])
-        if "login" in texto.lower() and "no video" not in texto.lower():
+        if "login" in texto.lower() and "no video" not in texto.lower() and "unsupported url" not in texto.lower():
             raise
     return arquivos_da_pasta(pasta, VID_EXT)
 
@@ -252,18 +303,28 @@ def baixar():
         nomes = {"instagram": "Instagram", "facebook": "Facebook"}
         return jsonify(erro=f"Esse link é do {nomes[detectada]}, não do {nomes[plataforma]}."), 400
 
+    url_original = url
+    if detectada == "facebook":
+        url = resolver_facebook(url)
+
     pasta = tempfile.mkdtemp(prefix="baixador_")
     try:
         arquivos = buscar(tipo, url, detectada, pasta)
+        if not arquivos and tipo == "video" and url != url_original:
+            arquivos = buscar_videos(url_original, pasta)  # vídeos do Facebook já funcionavam com o link original
         if not arquivos:
             # Não achou o que foi pedido: tenta o outro tipo (ex.: escolheu Imagem mas o post é vídeo)
             outro = "video" if tipo == "imagem" else "imagem"
             app.logger.info("Nada de %s em %s; tentando %s", tipo, url, outro)
             arquivos = buscar(outro, url, detectada, pasta)
+            if not arquivos and outro == "video" and url != url_original:
+                arquivos = buscar_videos(url_original, pasta)
             if arquivos:
                 tipo = outro
 
         if not arquivos:
+            if detectada == "facebook":
+                return jsonify(erro="Não consegui pegar esse post. O Facebook pode estar pedindo login para ele (post restrito ou de grupo)."), 404
             return jsonify(erro="Não encontrei foto nem vídeo nesse link. Confira se o post é público."), 404
 
         if len(arquivos) == 1:
@@ -289,6 +350,8 @@ def baixar():
         texto = str(e)
         app.logger.error("Falha yt-dlp em %s: %s", url, texto)
         if "login" in texto.lower() or "cookies" in texto.lower():
+            if detectada == "facebook":
+                return jsonify(erro="O Facebook só mostra esse post para quem está logado (post restrito ou bloqueio ao servidor)."), 403
             return jsonify(erro="Esse post exige login. Veja no LEIA-ME como usar o cookies.txt."), 403
         return jsonify(erro="Não consegui baixar: " + texto.replace("ERROR: ", "")[:300]), 502
     except subprocess.TimeoutExpired:
