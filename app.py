@@ -116,31 +116,66 @@ class EVideo(Exception):
 ROBO_FACEBOOK = {"User-Agent": "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)"}
 
 
+def _link_do_post(texto):
+    """Acha o endereço real do post dentro de um texto (URL de login, HTML ou mensagem de erro)."""
+    from urllib.parse import unquote
+    t = texto
+    for _ in range(3):  # o endereço costuma vir codificado 1 ou 2 vezes
+        t = unquote(t)
+    t = t.replace("\\/", "/").replace("&amp;", "&")
+    m = re.search(r"story_fbid=(\d+)&(?:amp;)?id=(\d+)", t) or re.search(r"[?&]id=(\d+)&(?:amp;)?story_fbid=(\d+)", t)
+    if m:
+        a, b = m.groups()
+        post, dono = (a, b) if "story_fbid=" + a in t else (b, a)
+        return f"https://www.facebook.com/{dono}/posts/{post}/"
+    m = re.search(r"facebook\.com/groups/([\w.]+)/(?:permalink|posts)/(\d+)", t)
+    if m:
+        return f"https://www.facebook.com/groups/{m.group(1)}/permalink/{m.group(2)}/"
+    m = re.search(r"facebook\.com/([\w.]+)/(posts|videos)/([\w]+)", t)
+    if m and m.group(1) not in ("share", "login"):
+        return f"https://www.facebook.com/{m.group(1)}/{m.group(2)}/{m.group(3)}/"
+    m = re.search(r"facebook\.com/(?:photo(?:\.php)?/?\?fbid=|photo/\?fbid=)(\d+)", t)
+    if m:
+        return f"https://www.facebook.com/photo/?fbid={m.group(1)}"
+    m = re.search(r"facebook\.com/(reel|watch/\?v=)/?(\d+)", t)
+    if m:
+        return f"https://www.facebook.com/reel/{m.group(2)}/" if m.group(1) == "reel" else f"https://www.facebook.com/watch/?v={m.group(2)}"
+    return None
+
+
 def resolver_facebook(url):
-    """Links /share/... redirecionam para o login, mas o endereço real do post vem junto no "next".
-    Devolve o link direto do post (ex.: facebook.com/<id>/posts/<post>), que não pede login."""
+    """Links /share/... levam ao login, mas o endereço real do post vem junto.
+    Devolve o link direto do post (ex.: facebook.com/<id>/posts/<post>)."""
     if not re.search(r"facebook\.com/share/|fb\.watch/|m\.facebook\.com|web\.facebook\.com", url):
         return url
-    try:
-        r = requests.get(url, headers=NAVEGADOR, timeout=15, allow_redirects=True)
-        final = r.url
-    except requests.RequestException as e:
-        app.logger.warning("Não consegui resolver %s: %s", url, e)
-        return url
-    if "/login" in final:
-        prox = parse_qs(urlparse(final).query).get("next", [""])[0]
-        if prox:
-            final = prox
-    q = parse_qs(urlparse(final).query)
-    if "story_fbid" in q and "id" in q:
-        final = f"https://www.facebook.com/{q['id'][0]}/posts/{q['story_fbid'][0]}/"
-    elif "fbid" in q and "photo" in final:
-        final = f"https://www.facebook.com/photo/?fbid={q['fbid'][0]}"
-    final = final.replace("://m.facebook.com", "://www.facebook.com").replace("://web.facebook.com", "://www.facebook.com")
-    if final != url:
-        app.logger.info("Link do Facebook resolvido: %s -> %s", url, final)
-    return final
-
+    achado = None
+    # 1º: segue os redirecionamentos com alguns "disfarces" diferentes
+    for cab in (dict(NAVEGADOR, Accept="text/html,application/xhtml+xml"), ROBO_FACEBOOK, {"User-Agent": "Mozilla/5.0"}):
+        try:
+            r = requests.get(url, headers=cab, timeout=15, allow_redirects=True)
+        except requests.RequestException as e:
+            app.logger.warning("Resolver %s falhou: %s", url, e)
+            continue
+        candidatos = [h.headers.get("Location", "") for h in r.history] + [r.url, r.text[:300000]]
+        for c in candidatos:
+            achado = _link_do_post(c)
+            if achado:
+                break
+        if achado:
+            break
+    # 2º: pergunta ao yt-dlp (ele sempre chega no link de login com o endereço real)
+    if not achado:
+        try:
+            with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "skip_download": True, "socket_timeout": 15}) as ydl:
+                info = ydl.extract_info(url, download=False, process=False)
+            achado = _link_do_post(str(info.get("webpage_url") or info.get("url") or ""))
+        except Exception as e:  # noqa: BLE001
+            achado = _link_do_post(str(e))
+    if achado:
+        app.logger.info("Link do Facebook resolvido: %s -> %s", url, achado)
+        return achado
+    app.logger.warning("Não consegui resolver o link do Facebook: %s", url)
+    return url
 
 def _fotos_do_html_facebook(html):
     """Pega as fotos do post (ignora foto de perfil, emojis e ícones)."""
@@ -164,7 +199,8 @@ def urls_imagem_facebook(url):
         if re.search(r"<video|\"video_id\"|/videos/", html) and not _fotos_do_html_facebook(html):
             raise EVideo()
         urls = _fotos_do_html_facebook(html)
-        app.logger.info("Embed do Facebook: %d foto(s) em %s", len(urls), url)
+        app.logger.info("Embed do Facebook: %d foto(s) em %s (página com %d caracteres%s)", len(urls), url, len(html),
+                        ", pede login" if "login" in html.lower()[:20000] else "")
         if urls:
             return urls[:20]
     except requests.RequestException as e:
