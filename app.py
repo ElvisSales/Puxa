@@ -17,7 +17,7 @@ import requests
 from flask import Flask, jsonify, render_template, request, send_file
 import yt_dlp
 
-app = Flask(__name__)
+app = Flask(__name__, template_folder=".")
 
 # Opcional: arquivo de cookies (formato Netscape) para posts que exigem login
 COOKIES_FILE = os.environ.get("COOKIES_FILE") or (
@@ -108,12 +108,31 @@ def urls_imagem_instagram(url):
     return unicas[:20]
 
 
-def urls_imagem_og(url):
-    """Plano B genérico (Facebook): a imagem de pré-visualização da página."""
-    html = requests.get(url, headers=NAVEGADOR, timeout=20).text
-    m = re.search(r'<meta[^>]+property="og:image"[^>]+content="([^"]+)"', html) or \
-        re.search(r'<meta[^>]+content="([^"]+)"[^>]+property="og:image"', html)
-    return [_limpar_url(m.group(1))] if m else []
+class EVideo(Exception):
+    """O post é um vídeo."""
+
+
+ROBO_FACEBOOK = {"User-Agent": "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)"}
+
+
+def urls_imagem_facebook(url):
+    """Lê a página como o robô de prévias do Facebook (o mesmo que monta as prévias do WhatsApp)."""
+    urls = []
+    for cabecalho in (ROBO_FACEBOOK, NAVEGADOR):
+        r = requests.get(url, headers=cabecalho, timeout=20, allow_redirects=True)
+        html = r.text
+        if re.search(r'property="og:video|property="og:type"[^>]+content="video|content="video[^"]*"[^>]+property="og:type"', html):
+            app.logger.info("Prévia do Facebook indica vídeo em %s", url)
+            raise EVideo()  # é vídeo: a "foto" seria só a capa; vai direto para o vídeo
+        for padrao in (r'<meta[^>]+property="og:image(?::url)?"[^>]+content="([^"]+)"',
+                       r'<meta[^>]+content="([^"]+)"[^>]+property="og:image(?::url)?"'):
+            for achado in re.findall(padrao, html):
+                u = _limpar_url(achado)
+                if u.startswith("http") and u not in urls and "static.xx.fbcdn" not in u and "rsrc.php" not in u:
+                    urls.append(u)
+        if urls:
+            break
+    return urls
 
 
 def urls_imagem_ytdlp(url):
@@ -151,16 +170,6 @@ def salvar_imagens(urls, pasta, prefixo="imagem"):
                 f.write(r.content)
 
 
-def baixar_imagens_plano_b(url, plataforma, pasta):
-    urls = urls_imagem_instagram(url) if plataforma == "instagram" else urls_imagem_og(url)
-    for i, u in enumerate(urls, 1):
-        r = requests.get(u, headers=NAVEGADOR, timeout=30)
-        if r.ok and r.headers.get("Content-Type", "").startswith("image/"):
-            ext = ".png" if "png" in r.headers["Content-Type"] else ".webp" if "webp" in r.headers["Content-Type"] else ".jpg"
-            with open(os.path.join(pasta, f"imagem_{i:02d}{ext}"), "wb") as f:
-                f.write(r.content)
-
-
 def arquivos_da_pasta(pasta, extensoes):
     achados = []
     for raiz, _, nomes in os.walk(pasta):
@@ -171,13 +180,52 @@ def arquivos_da_pasta(pasta, extensoes):
 
 
 def tem_anuncio():
-    """True se templates/anuncio.html tiver algum código além de comentários."""
-    caminho = os.path.join(app.root_path, "templates", "anuncio.html")
+    """True se anuncio.html tiver algum código além de comentários."""
+    caminho = os.path.join(app.root_path, "anuncio.html")
     if not os.path.exists(caminho):
         return False
     with open(caminho, encoding="utf-8") as f:
         texto = re.sub(r"<!--.*?-->", "", f.read(), flags=re.S)
     return bool(texto.strip())
+
+
+def buscar_videos(url, pasta):
+    try:
+        baixar_video(url, pasta)
+    except yt_dlp.utils.DownloadError as e:
+        texto = str(e)
+        app.logger.warning("yt-dlp (vídeo) falhou em %s: %s", url, texto[:300])
+        if "login" in texto.lower() and "no video" not in texto.lower():
+            raise
+    return arquivos_da_pasta(pasta, VID_EXT)
+
+
+def buscar_imagens(url, plataforma, pasta):
+    """Tenta vários caminhos, do mais rápido ao mais lento, até achar fotos."""
+    if plataforma == "instagram":
+        caminhos = [("yt-dlp", lambda: salvar_imagens(urls_imagem_ytdlp(url), pasta)),
+                    ("embed", lambda: salvar_imagens(urls_imagem_instagram(url), pasta)),
+                    ("gallery-dl", lambda: baixar_imagens(url, pasta))]
+    else:
+        caminhos = [("prévia do Facebook", lambda: salvar_imagens(urls_imagem_facebook(url), pasta)),
+                    ("yt-dlp", lambda: salvar_imagens(urls_imagem_ytdlp(url), pasta)),
+                    ("gallery-dl", lambda: baixar_imagens(url, pasta))]
+    for nome, tentar in caminhos:
+        try:
+            tentar()
+        except EVideo:
+            return []
+        except Exception as e:  # noqa: BLE001
+            app.logger.warning("%s (fotos) falhou em %s: %s", nome, url, str(e)[:300])
+        arquivos = arquivos_da_pasta(pasta, IMG_EXT)
+        app.logger.info("%s achou %d imagem(ns) em %s", nome, len(arquivos), url)
+        if arquivos:
+            return arquivos
+    return []
+
+
+def buscar(tipo, url, plataforma, pasta):
+    return buscar_videos(url, pasta) if tipo == "video" else buscar_imagens(url, plataforma, pasta)
 
 
 @app.route("/")
@@ -206,42 +254,25 @@ def baixar():
 
     pasta = tempfile.mkdtemp(prefix="baixador_")
     try:
-        if tipo == "video":
-            baixar_video(url, pasta)
-            arquivos = arquivos_da_pasta(pasta, VID_EXT)
-        else:
-            # 1º: yt-dlp (mesmo caminho que já funciona para vídeos)
-            try:
-                salvar_imagens(urls_imagem_ytdlp(url), pasta)
-            except Exception as e:  # noqa: BLE001
-                app.logger.warning("yt-dlp (fotos) falhou em %s: %s", url, str(e)[:300])
-            arquivos = arquivos_da_pasta(pasta, IMG_EXT)
-            app.logger.info("yt-dlp achou %d imagem(ns) em %s", len(arquivos), url)
-            # 2º: caminho rápido pela página pública do post
-            if not arquivos:
-                try:
-                    baixar_imagens_plano_b(url, detectada, pasta)
-                except requests.RequestException as e:
-                    app.logger.warning("Caminho rápido falhou em %s: %s", url, e)
-                arquivos = arquivos_da_pasta(pasta, IMG_EXT)
-                app.logger.info("Caminho rápido achou %d imagem(ns) em %s", len(arquivos), url)
-            # 3º: se ainda não achou nada, tenta o gallery-dl
-            if not arquivos:
-                try:
-                    baixar_imagens(url, pasta)
-                except (RuntimeError, subprocess.TimeoutExpired) as e:
-                    app.logger.warning("gallery-dl falhou em %s: %s", url, str(e)[:300])
-                arquivos = arquivos_da_pasta(pasta, IMG_EXT)
+        arquivos = buscar(tipo, url, detectada, pasta)
+        if not arquivos:
+            # Não achou o que foi pedido: tenta o outro tipo (ex.: escolheu Imagem mas o post é vídeo)
+            outro = "video" if tipo == "imagem" else "imagem"
+            app.logger.info("Nada de %s em %s; tentando %s", tipo, url, outro)
+            arquivos = buscar(outro, url, detectada, pasta)
+            if arquivos:
+                tipo = outro
 
         if not arquivos:
-            msg = "Nenhum vídeo encontrado nesse link." if tipo == "video" else "Nenhuma imagem encontrada nesse link."
-            return jsonify(erro=msg + " Confira se escolheu o tipo certo ou se o post é público."), 404
+            return jsonify(erro="Não encontrei foto nem vídeo nesse link. Confira se o post é público."), 404
 
         if len(arquivos) == 1:
             caminho = arquivos[0]
             with open(caminho, "rb") as f:
                 conteudo = io.BytesIO(f.read())
-            return send_file(conteudo, as_attachment=True, download_name=f"{detectada}_{os.path.basename(caminho)}")
+            resp = send_file(conteudo, as_attachment=True, download_name=f"{detectada}_{os.path.basename(caminho)}")
+            resp.headers["X-Tipo"] = tipo
+            return resp
 
         # Vários arquivos (carrossel) → um .zip
         zip_mem = io.BytesIO()
@@ -249,8 +280,10 @@ def baixar():
             for caminho in arquivos:
                 z.write(caminho, os.path.basename(caminho))
         zip_mem.seek(0)
-        return send_file(zip_mem, as_attachment=True, download_name=f"{detectada}_{'imagens' if tipo == 'imagem' else 'videos'}.zip",
+        resp = send_file(zip_mem, as_attachment=True, download_name=f"{detectada}_{'imagens' if tipo == 'imagem' else 'videos'}.zip",
                          mimetype="application/zip")
+        resp.headers["X-Tipo"] = tipo
+        return resp
 
     except yt_dlp.utils.DownloadError as e:
         texto = str(e)

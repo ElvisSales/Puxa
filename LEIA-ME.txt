@@ -33,7 +33,7 @@ Baixe apenas conteúdo seu ou que você tenha permissão para usar.
 ANÚNCIOS
 1. Crie conta numa rede de anúncios (ex.: Adsterra ou Monetag) e cadastre seu site.
 2. Gere um banner 300x250 e copie o código que eles dão.
-3. Abra templates/anuncio.html, cole o código no lugar do comentário e salve.
+3. Abra anuncio.html, cole o código no lugar do comentário e salve.
 4. Suba o arquivo no GitHub (Add file > Upload files > Commit). O Render atualiza sozinho.
 Para ver a tela de anúncio antes de ter o código: abra o site com ?anuncio no final.
-Para mudar o tempo até liberar o X: em templates/index.html, SEGUNDOS_ANUNCIO = 5.
+Para mudar o tempo até liberar o X: em index.html, SEGUNDOS_ANUNCIO = 5.
